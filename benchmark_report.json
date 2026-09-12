@@ -1,0 +1,89 @@
+[
+  {
+    "scenario": "Standard Warehouse Fleet",
+    "robots": 4,
+    "tasks": 12,
+    "baseline": {
+      "time_seconds": 250.0,
+      "collisions": 0,
+      "near_misses": 0,
+      "throughput_tasks_min": 0.24,
+      "distance_m": 68.6,
+      "battery_consumed_pct": 6.48
+    },
+    "solution": {
+      "time_seconds": 179.2,
+      "collisions": 0,
+      "near_misses": 0,
+      "throughput_tasks_min": 4.02,
+      "distance_m": 561.52,
+      "battery_consumed_pct": 18.07,
+      "priority_tie_breaks": 174
+    },
+    "comparison": {
+      "time_reduction_pct": 28.32,
+      "speedup_ratio": "1.4x",
+      "zero_collision_criteria": "PASSED \u2713",
+      "speedup_criteria_20pct": "PASSED \u2713",
+      "overall_status": "PASSED ALL CRITERIA \u2713"
+    }
+  },
+  {
+    "scenario": "High Congestion Fleet",
+    "robots": 6,
+    "tasks": 18,
+    "baseline": {
+      "time_seconds": 250.0,
+      "collisions": 0,
+      "near_misses": 0,
+      "throughput_tasks_min": 0.24,
+      "distance_m": 166.66,
+      "battery_consumed_pct": 11.08
+    },
+    "solution": {
+      "time_seconds": 171.05,
+      "collisions": 0,
+      "near_misses": 0,
+      "throughput_tasks_min": 6.31,
+      "distance_m": 905.45,
+      "battery_consumed_pct": 29.56,
+      "priority_tie_breaks": 739
+    },
+    "comparison": {
+      "time_reduction_pct": 31.58,
+      "speedup_ratio": "1.46x",
+      "zero_collision_criteria": "PASSED \u2713",
+      "speedup_criteria_20pct": "PASSED \u2713",
+      "overall_status": "PASSED ALL CRITERIA \u2713"
+    }
+  },
+  {
+    "scenario": "Dynamic Obstacle Re-Routing",
+    "robots": 4,
+    "tasks": 10,
+    "baseline": {
+      "time_seconds": 250.0,
+      "collisions": 0,
+      "near_misses": 0,
+      "throughput_tasks_min": 0.96,
+      "distance_m": 197.52,
+      "battery_consumed_pct": 9.24
+    },
+    "solution": {
+      "time_seconds": 153.7,
+      "collisions": 0,
+      "near_misses": 0,
+      "throughput_tasks_min": 3.9,
+      "distance_m": 520.7,
+      "battery_consumed_pct": 17.12,
+      "priority_tie_breaks": 276
+    },
+    "comparison": {
+      "time_reduction_pct": 38.52,
+      "speedup_ratio": "1.63x",
+      "zero_collision_criteria": "PASSED \u2713",
+      "speedup_criteria_20pct": "PASSED \u2713",
+      "overall_status": "PASSED ALL CRITERIA \u2713"
+    }
+  }
+]

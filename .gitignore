@@ -1,0 +1,22 @@
+# Python & Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+*.py[cod]
+*$py.class
+__pycache__/
+
+# Testing & Caches
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# OS Specific
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
