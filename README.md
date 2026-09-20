@@ -72,20 +72,6 @@ Designed for constrained edge computing hardware (e.g. Raspberry Pi / NVIDIA Jet
 
 ---
 
-## Installation & Setup
-
-```bash
-cd /Users/aarushgupta/.gemini/antigravity/scratch/decentralized_amr_fleet
-
-# Activate Python virtual environment
-source .venv/bin/activate
-
-# Install dependencies (already completed)
-pip install -r requirements.txt
-```
-
----
-
 ## Running the System
 
 ### 1. Launch Interactive Web Dashboard
