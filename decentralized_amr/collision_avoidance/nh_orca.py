@@ -44,6 +44,22 @@ class NHORCASolver:
         self.max_angular_speed = self.cfg.max_angular_speed
         self.max_linear_accel = self.cfg.max_linear_accel
         self.max_angular_accel = self.cfg.max_angular_accel
+        self.last_orca_lines: List[HalfPlaneLine] = []
+
+    def get_orca_state(self) -> List[List[float]]:
+        """
+        Returns flattened velocity obstacle boundary line representations:
+        [[point_x, point_y, dir_x, dir_y], ...]
+        """
+        return [
+            [
+                round(float(line.point[0]), 3),
+                round(float(line.point[1]), 3),
+                round(float(line.direction[0]), 3),
+                round(float(line.direction[1]), 3)
+            ]
+            for line in self.last_orca_lines
+        ]
 
     def compute_nh_control(
         self,
@@ -91,6 +107,8 @@ class NHORCASolver:
             line = self._compute_agent_orca_line(p_i, v_i, p_j, v_j, combined_radius, self.time_horizon, dt)
             if line:
                 orca_lines.append(line)
+
+        self.last_orca_lines = orca_lines
 
         # 3. Solve 2D Linear Program to find optimal holonomic velocity v_opt
         v_opt = self._solve_2d_lp(orca_lines, self.max_speed, v_pref)

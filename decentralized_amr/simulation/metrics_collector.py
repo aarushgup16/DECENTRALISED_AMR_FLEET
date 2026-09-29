@@ -30,13 +30,15 @@ class SimulationMetrics:
     throughput_tasks_per_min: float = 0.0
     priority_tie_breaks: int = 0
     cbba_consensus_events: int = 0
+    dropped_packets: int = 0
+    stale_node_events: int = 0
     collision_log: List[CollisionEvent] = field(default_factory=list)
 
 
 class MetricsCollector:
     """
     Real-time telemetry and validation monitor.
-    Tracks collisions, task durations, battery, and throughput.
+    Tracks collisions, task durations, battery, throughput, and network chaos stats.
     """
 
     def __init__(self, physical_radius: float = 0.35):
@@ -52,6 +54,8 @@ class MetricsCollector:
         self.task_start_times: Dict[str, float] = {}
         self.task_end_times: Dict[str, float] = {}
         self.total_tasks_count = 0
+        self.last_heard_times: Dict[int, float] = {}
+        self.stale_node_events_count = 0
 
     def start_scenario(self, total_tasks: int):
         """Reset and initialize scenario metrics."""
@@ -62,6 +66,20 @@ class MetricsCollector:
         self.deadlock_events.clear()
         self.task_start_times.clear()
         self.task_end_times.clear()
+        self.last_heard_times.clear()
+        self.stale_node_events_count = 0
+
+    def record_node_telemetry_receipt(self, node_id: int, sim_time: float):
+        """Record timestamp of successful P2P packet delivery from node."""
+        self.last_heard_times[node_id] = sim_time
+
+    def get_stale_nodes(self, current_sim_time: float, timeout_s: float = 1.0) -> List[int]:
+        """Identify nodes whose telemetry is older than timeout_s (dead zone / dropped)."""
+        stale = []
+        for nid, t in self.last_heard_times.items():
+            if current_sim_time - t > timeout_s:
+                stale.append(nid)
+        return stale
 
     def update(self, current_sim_time: float, robot_positions: List[Tuple[int, float, float]]):
         """
@@ -110,7 +128,8 @@ class MetricsCollector:
         total_fleet_distance: float,
         total_battery_used: float,
         priority_tie_breaks: int = 0,
-        cbba_events: int = 0
+        cbba_events: int = 0,
+        dropped_packets: int = 0
     ) -> SimulationMetrics:
         """Compute aggregated run metrics."""
         tasks_done = len(self.task_end_times)
@@ -129,6 +148,8 @@ class MetricsCollector:
             throughput_tasks_per_min=round(throughput, 2),
             priority_tie_breaks=priority_tie_breaks,
             cbba_consensus_events=cbba_events,
+            dropped_packets=dropped_packets,
+            stale_node_events=self.stale_node_events_count,
             collision_log=list(self.collision_events)
         )
 

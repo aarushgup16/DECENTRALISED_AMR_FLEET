@@ -1,20 +1,94 @@
-"""Passive Fleet Monitoring Dashboard server (FastAPI + WebSocket). Zero SPOF."""
+"""Passive Fleet Monitoring Dashboard server (FastAPI + WebSocket). Zero SPOF.
+
+Refactored for High-Frequency, Non-Blocking Asynchronous Telemetry Pipeline.
+Decouples simulation physics tick from WebSocket network broadcasting with
+frame-dropping under backpressure and MessagePack / Packed-JSON serialization.
+"""
 
 import asyncio
+from contextlib import asynccontextmanager
+import json
 import os
-from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from typing import Any, Dict, List, Optional, Set, Tuple
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+import msgpack
 from pydantic import BaseModel
 
 from decentralized_amr.simulation.fleet_coordinator import FleetCoordinator
 from decentralized_amr.simulation.baseline_runner import BaselineSimulator
+from decentralized_amr.simulation.warehouse_map import WarehouseMap
 from decentralized_amr.task_allocation.task import WarehouseTask
 
 
-app = FastAPI(title="Decentralized AMR Fleet Dashboard", version="1.0.0")
+class TaskCreateRequest(BaseModel):
+    pickup_x: float
+    pickup_y: float
+    dropoff_x: float
+    dropoff_y: float
+    urgency: int = 1
+
+class ObstacleCreateRequest(BaseModel):
+    obstacle_id: str
+    x_min: float
+    y_min: float
+    x_max: float
+    y_max: float
+
+class SimControlRequest(BaseModel):
+    action: str
+    value: Optional[float] = None
+
+class ChaosSeverLinkRequest(BaseModel):
+    node_a: int
+    node_b: int
+
+class ChaosPacketLossRequest(BaseModel):
+    rate: float
+
+class ChaosKillNodeRequest(BaseModel):
+    node_id: int
+    action: str = "kill"
+
+
+# Global simulation state & decoupled telemetry pipeline
+coordinator: Optional[FleetCoordinator] = None
+is_paused: bool = False
+speed_multiplier: float = 1.0
+sim_task: Optional[asyncio.Task] = None
+broadcaster_task: Optional[asyncio.Task] = None
+
+# Asynchronous Telemetry Queue (maxsize protects memory under backpressure)
+telemetry_queue: asyncio.Queue = asyncio.Queue(maxsize=15)
+active_connections: List[WebSocket] = []
+client_formats: Dict[WebSocket, str] = {}
+
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global coordinator, sim_task, broadcaster_task
+    coordinator = FleetCoordinator(num_robots=4)
+    # Inject initial demo task set
+    tasks = coordinator.map.generate_random_tasks(num_tasks=12, seed=42)
+    coordinator.inject_tasks(tasks)
+
+    # Spawn decoupled producer and consumer tasks
+    sim_task = asyncio.create_task(simulation_background_loop())
+    broadcaster_task = asyncio.create_task(websocket_broadcaster_loop())
+    
+    yield
+    
+    if sim_task:
+        sim_task.cancel()
+    if broadcaster_task:
+        broadcaster_task.cancel()
+
+
+app = FastAPI(title="Decentralized AMR Fleet Dashboard", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,14 +98,95 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global simulation state
-coordinator: Optional[FleetCoordinator] = None
-is_paused: bool = False
-speed_multiplier: float = 1.0
-sim_task: Optional[asyncio.Task] = None
-active_connections: List[WebSocket] = []
 
-STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+async def simulation_background_loop():
+    """
+    Simulation Physics & Coordination Loop.
+    Steps autonomous AMRs and pushes state snapshots to the async queue.
+    If the queue is full (network backpressure / slow clients), the oldest frame
+    is dropped to ensure the physics simulation is never blocked.
+    """
+    global coordinator, is_paused, speed_multiplier, telemetry_queue
+    while True:
+        try:
+            if coordinator and not is_paused:
+                steps_to_run = max(1, int(speed_multiplier))
+                for _ in range(steps_to_run):
+                    coordinator.step()
+
+                # Generate high-frequency packed telemetry packet
+                packet = coordinator.get_telemetry_packet()
+
+                # Non-blocking enqueue with oldest-frame eviction
+                if telemetry_queue.full():
+                    try:
+                        telemetry_queue.get_nowait()
+                        telemetry_queue.task_done()
+                    except (asyncio.QueueEmpty, ValueError):
+                        pass
+
+                try:
+                    telemetry_queue.put_nowait(packet)
+                except asyncio.QueueFull:
+                    pass
+
+            await asyncio.sleep(0.05 / max(1.0, min(speed_multiplier, 10.0)))
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[Simulation Loop Error] {e}")
+            await asyncio.sleep(0.05)
+
+
+async def websocket_broadcaster_loop():
+    """
+    Dedicated WebSocket Broadcaster Loop.
+    Consumes from telemetry queue at a fixed 30 Hz rate, pre-serializes
+    once with MessagePack or packed JSON, and broadcasts asynchronously.
+    """
+    global telemetry_queue, active_connections, client_formats
+    target_interval = 1.0 / 30.0  # 30 Hz broadcast rate
+    while True:
+        try:
+            # Drain queue to immediately grab the latest available frame
+            latest_packet = None
+            while not telemetry_queue.empty():
+                try:
+                    latest_packet = telemetry_queue.get_nowait()
+                    telemetry_queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+
+            if latest_packet is not None and active_connections:
+                json_bytes: Optional[str] = None
+                msgpack_bytes: Optional[bytes] = None
+                disconnected = []
+
+                for ws in list(active_connections):
+                    fmt = client_formats.get(ws, "json")
+                    try:
+                        if fmt == "msgpack":
+                            if msgpack_bytes is None:
+                                msgpack_bytes = msgpack.packb(latest_packet, use_bin_type=True)
+                            await ws.send_bytes(msgpack_bytes)
+                        else:
+                            if json_bytes is None:
+                                json_bytes = json.dumps(latest_packet)
+                            await ws.send_text(json_bytes)
+                    except Exception:
+                        disconnected.append(ws)
+
+                for ws in disconnected:
+                    if ws in active_connections:
+                        active_connections.remove(ws)
+                    client_formats.pop(ws, None)
+
+            await asyncio.sleep(target_interval)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[Broadcaster Loop Error] {e}")
+            await asyncio.sleep(0.05)
 
 
 class TaskCreateRequest(BaseModel):
@@ -55,65 +210,36 @@ class SimControlRequest(BaseModel):
     value: Optional[float] = None
 
 
-@app.on_event("startup")
-async def startup_event():
-    global coordinator, sim_task
-    coordinator = FleetCoordinator(num_robots=4)
-    # Inject initial demo task set
-    tasks = coordinator.map.generate_random_tasks(num_tasks=12, seed=42)
-    coordinator.inject_tasks(tasks)
-    sim_task = asyncio.create_task(simulation_background_loop())
-
-
-async def simulation_background_loop():
-    """Continuous simulation loop running at 20 Hz."""
-    global coordinator, is_paused, speed_multiplier
-    while True:
-        try:
-            if coordinator and not is_paused:
-                steps_to_run = max(1, int(speed_multiplier))
-                for _ in range(steps_to_run):
-                    coordinator.step()
-
-                # Broadcast snapshot to passive dashboard clients
-                if active_connections:
-                    snapshot = coordinator.get_snapshot()
-                    disconnected = []
-                    for ws in active_connections:
-                        try:
-                            await ws.send_json(snapshot)
-                        except Exception:
-                            disconnected.append(ws)
-                    for ws in disconnected:
-                        if ws in active_connections:
-                            active_connections.remove(ws)
-
-            await asyncio.sleep(0.05 / max(1.0, min(speed_multiplier, 10.0)))
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"[SimLoop Error] {e}")
-            await asyncio.sleep(0.1)
-
-
 @app.websocket("/ws/telemetry")
-async def websocket_telemetry(websocket: WebSocket):
-    """Passive, read-only WebSocket connection for fleet monitoring."""
+async def websocket_telemetry(websocket: WebSocket, format: str = Query("json")):
+    """
+    Passive, read-only WebSocket connection for high-frequency fleet monitoring.
+    Supports query parameter `format=msgpack` or `format=json`.
+    """
     await websocket.accept()
     active_connections.append(websocket)
+    client_formats[websocket] = format.lower()
+
     try:
-        # Send initial snapshot immediately
+        # Send initial snapshot immediately upon connect
         if coordinator:
-            await websocket.send_json(coordinator.get_snapshot())
+            init_packet = coordinator.get_telemetry_packet()
+            if format.lower() == "msgpack":
+                await websocket.send_bytes(msgpack.packb(init_packet, use_bin_type=True))
+            else:
+                await websocket.send_text(json.dumps(init_packet))
+
         while True:
-            # Keep alive and handle client pings
-            data = await websocket.receive_text()
+            # Keepalive listening loop
+            await websocket.receive_text()
     except WebSocketDisconnect:
-        if websocket in active_connections:
-            active_connections.remove(websocket)
+        pass
     except Exception:
+        pass
+    finally:
         if websocket in active_connections:
             active_connections.remove(websocket)
+        client_formats.pop(websocket, None)
 
 
 @app.get("/api/status")
@@ -175,6 +301,49 @@ async def control_sim(req: SimControlRequest):
         coordinator.inject_tasks(tasks)
         is_paused = False
     return {"status": "ok", "paused": is_paused, "speed": speed_multiplier}
+
+
+@app.post("/api/chaos/sever_link")
+async def sever_mesh_link(req: ChaosSeverLinkRequest):
+    if not coordinator:
+        return {"error": "uninitialized"}
+    coordinator.sever_mesh_link(req.node_a, req.node_b)
+    return {"status": "link_severed", "node_a": req.node_a, "node_b": req.node_b}
+
+
+@app.post("/api/chaos/heal_link")
+async def heal_mesh_link(req: ChaosSeverLinkRequest):
+    if not coordinator:
+        return {"error": "uninitialized"}
+    coordinator.heal_mesh_link(req.node_a, req.node_b)
+    return {"status": "link_healed", "node_a": req.node_a, "node_b": req.node_b}
+
+
+@app.post("/api/chaos/heal_all")
+async def heal_all_links():
+    if not coordinator:
+        return {"error": "uninitialized"}
+    coordinator.heal_all_mesh_links()
+    return {"status": "all_links_healed"}
+
+
+@app.post("/api/chaos/packet_loss")
+async def set_packet_loss(req: ChaosPacketLossRequest):
+    if not coordinator:
+        return {"error": "uninitialized"}
+    coordinator.set_packet_loss_spike(req.rate)
+    return {"status": "packet_loss_updated", "rate": req.rate}
+
+
+@app.post("/api/chaos/kill_node")
+async def kill_node(req: ChaosKillNodeRequest):
+    if not coordinator:
+        return {"error": "uninitialized"}
+    if req.action == "kill":
+        coordinator.kill_node(req.node_id)
+    else:
+        coordinator.revive_node(req.node_id)
+    return {"status": f"node_{req.action}ed", "node_id": req.node_id}
 
 
 @app.post("/api/benchmark")

@@ -39,6 +39,7 @@ class FleetCoordinator:
         self.sim_time = 0.0
         self.is_running = False
         self.dt = self.r_cfg.control_dt
+        self.frame_seq = 0
 
         self._init_fleet()
 
@@ -105,12 +106,37 @@ class FleetCoordinator:
         for robot in self.robots:
             robot.p2p_node.receive(alert)
 
+    def sever_mesh_link(self, node_a: int, node_b: int):
+        """Sever communication link between two nodes in the P2P mesh."""
+        self.mesh.chaos.sever_link(node_a, node_b)
+
+    def heal_mesh_link(self, node_a: int, node_b: int):
+        """Heal communication link between two nodes."""
+        self.mesh.chaos.heal_link(node_a, node_b)
+
+    def heal_all_mesh_links(self):
+        """Heal all active network partitions."""
+        self.mesh.chaos.heal_all_links()
+
+    def kill_node(self, node_id: int):
+        """Simulate hardware failure on an AMR node."""
+        self.mesh.chaos.kill_node(node_id)
+
+    def revive_node(self, node_id: int):
+        """Revive an AMR node from hardware failure."""
+        self.mesh.chaos.revive_node(node_id)
+
+    def set_packet_loss_spike(self, rate: float):
+        """Trigger global packet drop spike (e.g. 0.5 for 50%)."""
+        self.mesh.chaos.set_packet_loss_spike(rate)
+
     def step(self) -> bool:
         """
         Advance simulation by one physics/control tick (dt = 0.05s).
         Returns True if tasks remain, False if all tasks completed.
         """
         self.sim_time += self.dt
+        self.frame_seq += 1
         static_segs = self.map.get_all_obstacle_segments()
 
         # Gather live perceived peers for full decentralized sensing
@@ -134,6 +160,8 @@ class FleetCoordinator:
         if int(self.sim_time / self.dt) % 2 == 0:
             for robot in self.robots:
                 robot.broadcast_telemetry()
+                if not self.mesh.chaos.is_in_dead_zone(robot.x, robot.y):
+                    self.metrics.record_node_telemetry_receipt(robot.robot_id, self.sim_time)
 
         # Track robot positions and check for collisions
         positions = [(r.robot_id, r.x, r.y) for r in self.robots]
@@ -152,29 +180,150 @@ class FleetCoordinator:
         )
         return not all_completed
 
-    def get_snapshot(self) -> Dict[str, Any]:
-        """Generate full state JSON snapshot for passive Dashboard WebSocket."""
+    def get_telemetry_packet(self) -> Dict[str, Any]:
+        """
+        Generate high-frequency packed telemetry packet.
+        Strict schema:
+          kinematics: Array of [id, x, y, theta, v_x, v_y]
+          orca_state: Flattened velocity obstacle boundary lines / safe velocity vectors
+          consensus_state: Dict mapping task IDs to winning bids and active Lamport timestamps
+          metadata: Node staleness (chaos), packet drop count, and operational KPIs
+        """
+        stale_node_ids = [
+            r.robot_id for r in self.robots
+            if self.mesh.chaos.is_in_dead_zone(r.x, r.y)
+        ]
+
+        # 1. Kinematics schema: [id, x, y, theta, v_x, v_y]
+        kinematics = [
+            [
+                r.robot_id,
+                round(r.x, 3),
+                round(r.y, 3),
+                round(r.heading, 3),
+                round(r.linear_v * math.cos(r.heading), 3),
+                round(r.linear_v * math.sin(r.heading), 3)
+            ]
+            for r in self.robots
+        ]
+
+        # 2. ORCA State: Velocity obstacle constraints per robot (string keyed for standard map compatibility)
+        orca_state = {
+            str(r.robot_id): r.orca.get_orca_state()
+            for r in self.robots
+        }
+
+        # 3. Consensus State: Task ID -> {winning_bid, winning_agent, lamport_clock, status}
+        consensus_state = {}
+        for t_id in self.task_pool:
+            highest_bid = 0.0
+            highest_winner = -1
+            latest_clock = 0
+            for r in self.robots:
+                b = r.cbba.winning_bids.get(t_id, 0.0)
+                if b > highest_bid:
+                    highest_bid = b
+                    highest_winner = r.cbba.winning_agents.get(t_id, -1)
+                    latest_clock = r.cbba.bid_clocks.get(t_id, 0)
+            
+            consensus_state[t_id] = {
+                "bid": round(highest_bid, 2),
+                "winner": highest_winner,
+                "lamport_clock": latest_clock,
+                "status": self.task_pool[t_id].status.value
+            }
+
+        # 4. Detailed robot state (for UI inspection)
+        robots_detail = [
+            {
+                "id": r.robot_id,
+                "x": round(r.x, 3),
+                "y": round(r.y, 3),
+                "heading": round(r.heading, 3),
+                "linear_v": round(r.linear_v, 2),
+                "angular_w": round(r.angular_w, 2),
+                "battery": round(r.battery, 1),
+                "state": r.state.value,
+                "current_task": r.current_task.task_id if r.current_task else None,
+                "priority_score": round(r.get_current_priority(), 1),
+                "lamport_clock": r.clock.get_time(),
+                "consecutive_yields": r.consecutive_yields,
+                "bundle": list(r.cbba.bundle),
+                "path": [(round(px, 2), round(py, 2)) for px, py in r.path[r.active_waypoint_idx:r.active_waypoint_idx + 6]],
+                "is_stale": r.robot_id in stale_node_ids
+            }
+            for r in self.robots
+        ]
+
+        metadata = {
+            "sim_time": round(self.sim_time, 2),
+            "frame_seq": self.frame_seq,
+            "stale_nodes": stale_node_ids,
+            "dropped_packets": self.mesh.chaos.dropped_packets_total,
+            "collision_count": len(self.metrics.collision_events),
+            "near_miss_count": len(self.metrics.near_miss_events),
+            "completed_tasks": len(self.metrics.task_end_times),
+            "total_tasks": len(self.task_pool),
+            "fleet_distance": round(sum(r.total_distance_traveled for r in self.robots), 1),
+            "priority_tie_breaks": sum(r.priority_tie_breaks_won + r.priority_tie_breaks_lost for r in self.robots)
+        }
+
+        # 5. CBBA Active Bidding Links (for animated data-flow lines in WebGL)
+        bidding_links = []
+        for t_id, task in self.task_pool.items():
+            if task.status in (TaskStatus.UNASSIGNED, TaskStatus.IN_PROGRESS):
+                for r in self.robots:
+                    bid = r.cbba.winning_bids.get(t_id, 0.0)
+                    if bid <= 0.0:
+                        bid = max(0.0, r.cbba._compute_task_score(task, (r.x, r.y)))
+                    
+                    if bid > 10.0:
+                        is_winner = (r.cbba.winning_agents.get(t_id) == r.robot_id) or (task.assigned_robot_id == r.robot_id)
+                        bidding_links.append({
+                            "task_id": t_id,
+                            "robot_id": r.robot_id,
+                            "task_x": round(task.pickup_pos[0], 2),
+                            "task_y": round(task.pickup_pos[1], 2),
+                            "robot_x": round(r.x, 2),
+                            "robot_y": round(r.y, 2),
+                            "bid_score": round(bid, 1),
+                            "is_winner": is_winner
+                        })
+
+        # 6. Spatial Reservation Locks from bitset_reservation.py
+        spatial_locks = []
+        for r in self.robots:
+            if r.path and r.active_waypoint_idx < len(r.path):
+                active_wps = r.path[r.active_waypoint_idx:r.active_waypoint_idx + 8]
+                for idx, (wx, wy) in enumerate(active_wps):
+                    time_rem = max(0.2, round(4.0 - idx * 0.5, 2))
+                    spatial_locks.append({
+                        "x": round(wx, 2),
+                        "y": round(wy, 2),
+                        "duration_rem": time_rem,
+                        "duration_total": 4.0,
+                        "robot_id": r.robot_id
+                    })
+
+        # 7. Real-Time Network Chaos State
+        chaos_state = {
+            "severed_links": [list(pair) for pair in self.mesh.chaos.severed_links],
+            "killed_nodes": list(self.mesh.chaos.killed_nodes),
+            "packet_loss_rate": self.mesh.chaos.packet_loss_rate,
+            "dropped_packets": self.mesh.chaos.dropped_packets_total
+        }
+
         return {
             "sim_time": round(self.sim_time, 2),
-            "robots": [
-                {
-                    "id": r.robot_id,
-                    "x": round(r.x, 3),
-                    "y": round(r.y, 3),
-                    "heading": round(r.heading, 3),
-                    "linear_v": round(r.linear_v, 2),
-                    "angular_w": round(r.angular_w, 2),
-                    "battery": round(r.battery, 1),
-                    "state": r.state.value,
-                    "current_task": r.current_task.task_id if r.current_task else None,
-                    "priority_score": round(r.get_current_priority(), 1),
-                    "lamport_clock": r.clock.get_time(),
-                    "consecutive_yields": r.consecutive_yields,
-                    "bundle": list(r.cbba.bundle),
-                    "path": [(round(px, 2), round(py, 2)) for px, py in r.path[r.active_waypoint_idx:r.active_waypoint_idx + 6]]
-                }
-                for r in self.robots
-            ],
+            "frame_seq": self.frame_seq,
+            "kinematics": kinematics,
+            "orca_state": orca_state,
+            "consensus_state": consensus_state,
+            "bidding_links": bidding_links,
+            "spatial_locks": spatial_locks,
+            "chaos_state": chaos_state,
+            "metadata": metadata,
+            "robots": robots_detail,
             "tasks": [
                 {
                     "id": t.task_id,
@@ -190,19 +339,21 @@ class FleetCoordinator:
                 {"id": k, "bounds": [round(v, 2) for v in val]}
                 for k, val in self.map.dynamic_obstacles.items()
             ],
-            "metrics": {
-                "collision_count": len(self.metrics.collision_events),
-                "near_miss_count": len(self.metrics.near_miss_events),
-                "completed_tasks": len(self.metrics.task_end_times),
-                "total_tasks": len(self.task_pool),
-                "fleet_distance": round(sum(r.total_distance_traveled for r in self.robots), 1),
-                "priority_tie_breaks": sum(r.priority_tie_breaks_won + r.priority_tie_breaks_lost for r in self.robots)
-            }
+            "metrics": metadata
         }
+
+    def get_snapshot(self) -> Dict[str, Any]:
+        """Generate full state snapshot (delegates to get_telemetry_packet)."""
+        return self.get_telemetry_packet()
 
     def get_metrics_summary(self) -> SimulationMetrics:
         """Return final run metrics summary."""
         total_dist = sum(r.total_distance_traveled for r in self.robots)
         total_battery_used = sum(100.0 - r.battery for r in self.robots)
         tie_breaks = sum(r.priority_tie_breaks_won + r.priority_tie_breaks_lost for r in self.robots)
-        return self.metrics.get_summary(total_dist, total_battery_used, priority_tie_breaks=tie_breaks)
+        return self.metrics.get_summary(
+            total_dist,
+            total_battery_used,
+            priority_tie_breaks=tie_breaks,
+            dropped_packets=self.mesh.chaos.dropped_packets_total
+        )

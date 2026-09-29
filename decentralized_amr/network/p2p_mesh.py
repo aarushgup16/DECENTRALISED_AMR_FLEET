@@ -145,8 +145,13 @@ class P2PMesh:
             if dist > sender.comm_range:
                 continue
 
-            # Check network degradation / dead zones
-            if self.chaos.should_drop(sender_pos, peer_pos):
+            # Check network degradation / dead zones / severed links / killed nodes
+            if self.chaos.should_drop(
+                sender_pos=sender_pos,
+                receiver_pos=peer_pos,
+                sender_id=sender.node_id,
+                receiver_id=peer.node_id
+            ):
                 continue
 
             peer.receive(message)
@@ -166,7 +171,12 @@ class P2PMesh:
         if not target_node:
             return
 
-        if self.chaos.should_drop(sender.position, target_node.position):
+        if self.chaos.should_drop(
+            sender_pos=sender.position,
+            receiver_pos=target_node.position,
+            sender_id=sender.node_id,
+            receiver_id=target_id
+        ):
             return
 
         target_node.receive(message)
